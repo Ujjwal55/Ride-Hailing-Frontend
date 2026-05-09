@@ -26,7 +26,7 @@ export default function OfferModal({ offer, onAccept, onDecline }: Props) {
       <div className="bg-white rounded-2xl shadow-xl p-6 w-80">
         <div className="flex justify-between items-center mb-4">
           <h2 className="text-lg font-bold text-gray-800">New Ride Offer!</h2>
-          <span className={`text-2xl font-bold ${countdown <= 3 ? 'text-red-500' : 'text-orange-500'}`}>{countdown}s</span>
+          <span className={`text-2xl font-bold ${countdown <= 10 ? 'text-red-500' : 'text-orange-500'}`}>{countdown}s</span>
         </div>
         <div className="space-y-2 text-sm text-gray-600 mb-5">
           <div className="flex justify-between"><span>Tier</span><span className="font-medium capitalize">{offer.tier ?? 'economy'}</span></div>

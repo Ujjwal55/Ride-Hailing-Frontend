@@ -6,8 +6,8 @@ import Header from '@/components/Header';
 import OfferModal from '@/components/OfferModal';
 import { useStore } from '@/lib/store';
 import { apiFetch, configureApi } from '@/lib/api';
-import { connectSocket } from '@/lib/socket';
-import { moveToward } from '@/lib/geo';
+import { connectSocket, joinRideRoom } from '@/lib/socket';
+import { moveToward, distanceMetres } from '@/lib/geo';
 
 const Map = dynamic(() => import('@/components/Map'), { ssr: false });
 
@@ -24,6 +24,10 @@ export default function DriverPage() {
   const [fare, setFare] = useState<number | null>(null);
   const [toast, setToast] = useState('');
   const intervalRef = useRef<NodeJS.Timeout | null>(null);
+  // Refs mirror state so the setInterval closure always reads current values (avoids stale closure)
+  const rideStateRef = useRef<string>('idle');
+  const pickupRef = useRef<{ lat: number; lng: number } | null>(null);
+  const destRef = useRef<{ lat: number; lng: number } | null>(null);
   const showToastFn = (msg: string) => { setToast(msg); setTimeout(() => setToast(''), 3000); };
 
   // ALL hooks before any early return — guard with _hasHydrated inside the effect
@@ -38,13 +42,38 @@ export default function DriverPage() {
 
     const handleOffer = (offer: any) => setPendingOffer(offer);
     const handleExpired = () => { setPendingOffer(null); showToastFn('Offer expired'); };
+    // SOS handler — show alert to driver but do NOT reset any ride state
+    const handleSos = (data: any) => {
+      showToastFn(`🚨 ${data.riderName ?? 'Rider'} has triggered an SOS. Please ensure their safety.`);
+    };
+    const handleRideCancelled = () => {
+      // Clear location ping interval directly via ref (stopLocationPings defined after early return)
+      if (intervalRef.current) { clearInterval(intervalRef.current); intervalRef.current = null; }
+      setRideStateSynced('idle');
+      setCurrentRide(null);
+      setPickupSynced(null);
+      setDestSynced(null);
+      setTripId(null);
+      setOnline(false);
+      showToastFn('Rider cancelled the ride');
+      if (user?.id) {
+        apiFetch(`/v1/drivers/${user.id}/status`, {
+          method: 'PATCH',
+          body: JSON.stringify({ status: 'offline' }),
+        }).catch(() => {});
+      }
+    };
 
     socket.on('offer.new', handleOffer);
     socket.on('offer.expired', handleExpired);
+    socket.on('sos.triggered', handleSos);
+    socket.on('ride.cancelled', handleRideCancelled);
 
     return () => {
       socket.off('offer.new', handleOffer);
       socket.off('offer.expired', handleExpired);
+      socket.off('sos.triggered', handleSos);
+      socket.off('ride.cancelled', handleRideCancelled);
     };
   }, [_hasHydrated, user?.id, accessToken]);
 
@@ -52,20 +81,26 @@ export default function DriverPage() {
   if (!_hasHydrated) return <div className="flex items-center justify-center h-screen text-gray-400 text-sm">Loading...</div>;
   if (!user) return null;
 
+  // Helpers that keep state and ref in sync — use these instead of setRideState/setPickup/setDest directly
+  const setRideStateSynced = (s: string) => { rideStateRef.current = s; setRideState(s); };
+  const setPickupSynced = (p: { lat: number; lng: number } | null) => { pickupRef.current = p; setPickup(p); };
+  const setDestSynced = (d: { lat: number; lng: number } | null) => { destRef.current = d; setDest(d); };
+
   const startLocationPings = () => {
     if (intervalRef.current) return;
     intervalRef.current = setInterval(async () => {
-      const target = rideState === 'assigned' && pickup
-        ? pickup
-        : rideState === 'started' && dest
-        ? dest
+      // Read from refs — not state — so the closure always gets current values
+      const target = rideStateRef.current === 'assigned' && pickupRef.current
+        ? pickupRef.current
+        : rideStateRef.current === 'started' && destRef.current
+        ? destRef.current
         : null;
 
       if (target) {
         const next = moveToward(locationRef.current, target);
         locationRef.current = next;
         setDisplayLocation({ ...next });
-        if (next.arrived && rideState === 'started') showToastFn('Arrived at destination! End the trip.');
+        if (next.arrived && rideStateRef.current === 'started') showToastFn('Arrived at destination! End the trip.');
       }
 
       try {
@@ -98,10 +133,12 @@ export default function DriverPage() {
         body: JSON.stringify({ rideId: pendingOffer.rideId, offerId: pendingOffer.offerId }),
       });
       setCurrentRide({ id: pendingOffer.rideId, state: 'assigned' });
-      setPickup({ lat: pendingOffer.pickupLat, lng: pendingOffer.pickupLng });
-      setDest({ lat: pendingOffer.destLat, lng: pendingOffer.destLng });
-      setRideState('assigned');
+      setPickupSynced({ lat: pendingOffer.pickupLat, lng: pendingOffer.pickupLng });
+      setDestSynced({ lat: pendingOffer.destLat, lng: pendingOffer.destLng });
+      setRideStateSynced('assigned');
       setPendingOffer(null);
+      // Join the ride room so the driver receives ride.cancelled if the rider cancels
+      joinRideRoom(pendingOffer.rideId);
       showToastFn('Ride accepted! Head to pickup.');
     } catch (err: any) {
       showToastFn(err.message ?? 'Failed to accept');
@@ -125,7 +162,7 @@ export default function DriverPage() {
     try {
       const res = await apiFetch<{ tripId: string }>(`/v1/trips/${currentRide.id}/start`, { method: 'POST' });
       setTripId(res.tripId);
-      setRideState('started');
+      setRideStateSynced('started');
       showToastFn('Trip started!');
     } catch (err: any) { showToastFn(err.message); }
   };
@@ -135,12 +172,12 @@ export default function DriverPage() {
     try {
       const res = await apiFetch<{ fare: number }>(`/v1/trips/${tripId}/end`, { method: 'POST' });
       setFare(Number(res.fare));
-      setRideState('ended');
+      setRideStateSynced('ended');
       setCurrentRide(null);
-      setPickup(null); setDest(null);
-      stopLocationPings();
-      setOnline(false);
-      showToastFn(`Trip ended! Fare: ₹${Number(res.fare).toFixed(0)}`);
+      setPickupSynced(null); setDestSynced(null);
+      // Driver stays online and keeps pinging — ready for the next ride immediately
+      // Location pings continue; they'll idle at destination until a new offer arrives
+      showToastFn(`Trip ended! Fare: ₹${Number(res.fare).toFixed(0)}. Ready for next ride.`);
     } catch (err: any) { showToastFn(err.message); }
   };
 
@@ -178,11 +215,30 @@ export default function DriverPage() {
             </button>
           </div>
 
-          {rideState === 'assigned' && (
-            <button onClick={startTrip} className="w-full bg-blue-600 text-white py-2 rounded-xl hover:bg-blue-700 font-medium">
-              Start Trip
-            </button>
-          )}
+          {rideState === 'assigned' && pickup && (() => {
+            const distM = Math.round(distanceMetres(displayLocation, pickup));
+            const canStart = distM <= 300;
+            return (
+              <div className="space-y-1">
+                <p className="text-xs text-center text-gray-500">
+                  {canStart
+                    ? `✅ At pickup (${distM}m) — ready to start`
+                    : `🚗 ${distM}m to pickup — drive closer to start`}
+                </p>
+                <button
+                  onClick={startTrip}
+                  disabled={!canStart}
+                  className={`w-full py-2 rounded-xl font-medium transition-all ${
+                    canStart
+                      ? 'bg-blue-600 text-white hover:bg-blue-700'
+                      : 'bg-gray-200 text-gray-400 cursor-not-allowed'
+                  }`}
+                >
+                  {canStart ? 'Start Trip' : `Start Trip (${distM}m away)`}
+                </button>
+              </div>
+            );
+          })()}
           {rideState === 'started' && (
             <button onClick={endTrip} className="w-full bg-green-600 text-white py-2 rounded-xl hover:bg-green-700 font-medium">
               End Trip
@@ -192,8 +248,9 @@ export default function DriverPage() {
             <div className="text-center">
               <p className="text-green-600 font-bold text-xl">Trip Complete!</p>
               <p className="text-gray-600">Fare collected: ₹{fare.toFixed(0)}</p>
-              <button onClick={() => { setRideState('idle'); setFare(null); }} className="mt-2 text-blue-600 text-sm hover:underline">
-                Ready for next ride
+              <p className="text-xs text-gray-400 mt-1">🟢 Still online — waiting for next ride</p>
+              <button onClick={() => { setRideStateSynced('idle'); setFare(null); }} className="mt-2 text-blue-600 text-sm hover:underline">
+                Dismiss
               </button>
             </div>
           )}
